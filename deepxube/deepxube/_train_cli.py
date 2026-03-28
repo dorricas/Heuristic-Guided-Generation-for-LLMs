@@ -1,0 +1,127 @@
+from typing import Optional, List
+import argparse
+from argparse import ArgumentParser
+
+from deepxube.factories.updater_factory import get_updater
+
+from deepxube.base.domain import State, Goal
+from deepxube.base.heuristic import HeurNNetPar, PolicyNNetPar
+from deepxube.base.updater import UpArgs, Update, UpdateHeur, UpdatePolicy
+from deepxube.base.trainer import TrainArgs
+from deepxube.trainers.utils.train_loop import TestArgs, train
+from deepxube.utils.command_line_utils import get_domain_from_arg, get_heur_nnet_par_from_arg, get_policy_nnet_par_from_arg
+import numpy as np
+import pickle
+
+
+def parser_train(parser: ArgumentParser) -> None:
+    parser.add_argument('--domain', type=str, required=True, help="Domain name and arguments.")
+
+    parser.add_argument('--heur', type=str, default=None, help="Heuristic neural network and arguments.")
+    parser.add_argument('--heur_type', type=str, default=None, help="V, QFix, QIn. V maps state/goal tuples to cost-to-go. "
+                                                                    "QFix maps state/goal tuples to q_values for a fixed action space. "
+                                                                    "QIn maps state/goal/action tuples to q_value (can be used in arbitrary action spaces).")
+
+    parser.add_argument('--policy', type=str, default=None, help="Policy neural network and arguments.")
+    parser.add_argument('--policy_samp', type=int, default=10, help="")
+    parser.add_argument('--policy_rand', type=int, default=5, help="")
+    parser.add_argument('--policy_kl', type=float, default=0.1, help="")
+
+    parser.add_argument('--pathfind', type=str, required=True, help="Pathfinding algorithm and arguments. Batch size of any pathfinding algorithm should be 1 "
+                                                                    "since updater assumes 1 instance is generated per iteration.")
+
+    parser.add_argument('--dir', type=str, required=True, help="Directory to save neural networks.")
+    parser.add_argument('--skip_heur', action='store_true', default=False, help="Set to skip training of heuristic function.")
+    parser.add_argument('--skip_policy', action='store_true', default=False, help="Set to skip training of policy.")
+
+    # train args
+    train_group = parser.add_argument_group('train')
+    train_group.add_argument('--batch_size', type=int, default=1000, help="Batch size.")
+    train_group.add_argument('--lr', type=float, default=0.001, help=" Learning rate.")
+    train_group.add_argument('--lr_d', type=float, default=0.9999993, help="Learning rate decay.")
+    train_group.add_argument('--max_itrs', type=int, default=100000, help="Maximum training iterations.")
+    train_group.add_argument('--display', type=int, default=0, help="Display frequency for nnet training.")
+    train_group.add_argument('--bal', action='store_true', default=False, help="Set to balance of number of steps to take to generate problem instances based "
+                                                                               "on percentage of states solved.")
+    train_group.add_argument('--rb', type=int, default=0, help="Number of updates worth of data to keep in replay buffer. If 0 then no replay buffer is used "
+                                                               "and training waits for update to finish to get data and randomly sample from that data. "
+                                                               "No replay buffer results in faster updates due to not having to use a separate network to "
+                                                               "compute the update, but is more susceptible to instability due to shifts in the distribution "
+                                                               "of states seen during search.")
+    train_group.add_argument('--up_lt', type=float, default=np.inf, help="Loss must be below this threshold for update.")
+
+    # updater args
+    update_group = parser.add_argument_group('update')
+    update_group.add_argument('--procs', type=int, default=1, help="Number of processes to generate update data.")
+    update_group.add_argument('--step_max', type=int, required=True, help="Maximum number of steps to take when generating problem instnaces.")
+    update_group.add_argument('--up_itrs', type=int, default=100, help="Number of iterations to check for update.")
+    update_group.add_argument('--up_gen_itrs', type=int, default=100, help="Number of iterations for which to generate training data per update check.")
+    update_group.add_argument('--search_itrs', type=int, default=1000, help="Number of search iterations to take when generating data.")
+    update_group.add_argument('--up_batch_size', type=int, default=100, help="Maximum number of problem instances to generate at a time. Lower if running out "
+                                                                             "of memory.")
+    update_group.add_argument('--up_nnet_batch_size', type=int, default=20000, help="Maximum number of inputs to give to any nnet at a time during update. "
+                                                                                    "Lower if running out of memory.")
+    update_group.add_argument('--her', action='store_true', default=False, help="If problem instance not solved during search, do hindsight experience replay "
+                                                                                "(HER) by relabeling deepest node in search tree as a goal state and "
+                                                                                "sampling a goal from it.")
+    update_group.add_argument('--sync_main', action='store_true', default=False, help="Use main nnet to search during update.")
+    update_group.add_argument('--up_v', action='store_true', default=False, help="Verbose update.")
+
+    # update heur args
+    update_group.add_argument('--backup', type=int, default=1, help="1 for Bellman backup, -1 for limited horizon bellman lookahead (LHBL)")
+
+    # update policy args
+    update_group.add_argument('--policy_rand_p', type=float, default=0.0, help="Probability of sampling random actions for training policy "
+                                                                               "(to prevent mode collapse)")
+
+    # test args
+    test_group = parser.add_argument_group('test')
+    test_group.add_argument('--t_file', type=str, default=None, help="File to use when testing.")
+    test_group.add_argument('--t_search_itrs', type=int, default=100, help="Number of search iterations when testing.")
+    test_group.add_argument('--t_up_freq', type=int, default=10, help="Test every t_up_freq updates.")
+    test_group.add_argument('--t_pathfinds', type=str, default="bwas", help="Comma separated list of pathfinding algorithms to use when testing.")
+    test_group.add_argument('--t_init', action='store_true', default=False, help="Set for testing before training begins.")
+
+    # other
+    parser.add_argument('--debug', action='store_true', default=False, help="Set for debug mode.")
+    parser.set_defaults(func=train_cli)
+
+
+def train_cli(args: argparse.Namespace) -> None:
+    # parse domain and heur_nnet
+    domain, domain_name = get_domain_from_arg(args.domain)
+
+    # update args
+    up_args: UpArgs = UpArgs(args.procs, args.up_itrs, args.step_max, args.search_itrs, ub_heur_solns=False, backup=args.backup,
+                             policy_rand_prob=args.policy_rand_p, up_gen_itrs=args.up_gen_itrs, up_batch_size=args.up_batch_size,
+                             nnet_batch_size=args.up_nnet_batch_size, sync_main=args.sync_main, v=args.up_v)
+
+    # parse nnets
+    heur_nnet_par: Optional[HeurNNetPar] = None
+    update_heur: Optional[UpdateHeur] = None
+    policy_nnet_par: Optional[PolicyNNetPar] = None
+    update_policy: Optional[UpdatePolicy] = None
+    if args.heur is not None:
+        heur_nnet_par = get_heur_nnet_par_from_arg(domain, domain_name, args.heur, args.heur_type)[0]
+        update_ret: Update = get_updater(domain, args.pathfind, up_args, args.her, "heur")
+        assert isinstance(update_ret, UpdateHeur)
+        update_heur = update_ret
+    if args.policy is not None:
+        policy_nnet_par = get_policy_nnet_par_from_arg(domain, domain_name, args.policy, args.policy_samp, args.policy_rand)[0]
+        update_ret = get_updater(domain, args.pathfind, up_args, args.her, "policy")
+        assert isinstance(update_ret, UpdatePolicy)
+        update_policy = update_ret
+
+    # train args
+    train_args: TrainArgs = TrainArgs(args.batch_size, args.lr, args.lr_d, args.max_itrs, args.bal, rb=args.rb, loss_thresh=args.up_lt,
+                                      policy_kl=args.policy_kl, skip_heur=args.skip_heur, skip_policy=args.skip_policy, display=args.display)
+
+    # test args
+    test_args: Optional[TestArgs] = None
+    if args.t_file is not None:
+        data = pickle.load(open(args.t_file, "rb"))
+        states: List[State] = data['states']
+        goals: List[Goal] = data['goals']
+        test_args = TestArgs(states, goals, args.t_search_itrs, args.t_pathfinds.split(","), args.up_nnet_batch_size, args.t_up_freq, args.t_init)
+
+    train(domain, heur_nnet_par, update_heur, policy_nnet_par, update_policy, args.dir, train_args, test_args=test_args, debug=args.debug)

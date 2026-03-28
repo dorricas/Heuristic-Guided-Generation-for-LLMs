@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+dynamic = ["version"]
+name = "deepxube"
+description = "Solving pathfinding problems in an explainable manner with deep learning, reinforcement learning, heuristic search, and logic"
+authors = [
+  {name = "Forest Agostinelli", email = "foresta@cse.sc.edu"},
+]
+requires-python = ">= 3.10"
+dependencies = ['torch>=2.0', 'numpy == 2.*', 'matplotlib', 'clingo', 'wget', 'filelock', 'pillow', 'types-Pillow', 'imageio', 'tensorboard']
+license = {file = "LICENSE.txt"}
+readme = "README.md"
+
+keywords = ["DeepXube", "DeepCubeA", "DeepCube", "deep learning", "reinforcement learning", "search", "heuristic search", "pathfinding", "planning", "Rubik's Cube", "Sliding Tile Puzzle", "Sokoban"]
+
+[project.urls]
+Repository = "https://github.com/forestagostinelli/DeepXube/"
+
+[tool.setuptools.dynamic]
+version = {attr = "deepxube.__version__"}
+
+
+# [tool.setuptools]
+# packages = ['deepxube']
+
+[tool.setuptools.packages.find]
+# where = ["deepxube"]
+include = ["deepxube*"]  # alternatively: `exclude = ["additional*"]`
+namespaces = false
+
+[project.optional-dependencies]
+test = ['pytest', 'pytest-cov', 'mypy', 'flake8', 'tox']
+
+[project.scripts]
+deepxube = "deepxube._cli:main"
+
+[tool.pytest.ini_options]
+addopts = "--cov=deepxube"
+testpaths = ["tests"]
