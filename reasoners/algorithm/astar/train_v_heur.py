@@ -300,7 +300,7 @@ def main(
         from reasoners.lm import ExLlamaModel
         device = torch.device("cuda:0")
         model = ExLlamaModel(model_dir, lora_dir=None, device=device, 
-                                max_batch_size=batch_size, max_new_tokens=200, 
+                                max_batch_size=n_candidate, max_new_tokens=200, 
                                 max_seq_length=2048, log_output=False)
     else:
         raise NotImplementedError(f"Model {base_lm} not fully integrated into train_v_heur script yet.")
@@ -308,6 +308,14 @@ def main(
     # ---------------------------------------------
     # SETUP ToT BLOCKSWORLD INFRASTRUCTURE
     # ---------------------------------------------
+    # Auto-detect PDDL VAL path if not set by the user's environment
+    if "VAL" not in os.environ:
+        val_path = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../../LLMs-Planning/planner_tools/VAL'))
+        if os.path.exists(val_path):
+            os.environ["VAL"] = val_path
+        else:
+            print(f"WARNING: The VAL environment variable is missing and could not be found at {val_path}.")
+            
     world_model = BlocksWorldModel(base_model=model, prompt=prompt, max_steps=max_steps)
     config = BWConfig(base_model=model, prompt=prompt, temperature=temperature, n_candidate=n_candidate)
     
