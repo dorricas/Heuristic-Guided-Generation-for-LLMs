@@ -160,6 +160,7 @@ class ExLlamaModel(LanguageModel):
             end = min(start + self.max_batch_size, len(inputs))
             with torch.inference_mode():
                 p_time = time.time()
+                print(f"  [ExLlama] Generating a batch of {end-start} sequences... (this may take ~5-15s)")
                 decoded = self.generate_simple(self.generator, inputs[start:end], max_new_tokens=max_new_tokens,
                                                eos_token_id=eos_token_id, hide_input=hide_input)
                 f_time = time.time()

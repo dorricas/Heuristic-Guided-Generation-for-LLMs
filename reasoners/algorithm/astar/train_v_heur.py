@@ -6,11 +6,13 @@ import random
 import datetime
 from collections import deque
 import logging
+import contextlib
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import fire
+from peft import get_peft_model, LoraConfig, TaskType
 
 # Ensure we can import from the main project root
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
@@ -103,7 +105,9 @@ class BWThoughtEnv:
             
         output_plan = "\n".join(state.action_history) + "\n"
         # BWEvaluator returns True if the output_plan legitimately solves the current instance
-        correct = self.evaluator.eval_output(self.current_instance, output_plan)
+        # Suppress the incredibly messy C++ prints so it doesn't spam your terminal!
+        with open(os.devnull, 'w') as f, contextlib.redirect_stdout(f):
+            correct = self.evaluator.eval_output(self.current_instance, output_plan)
         return correct
 
     def is_terminal(self, state: BWState) -> bool:
@@ -119,24 +123,12 @@ class BWThoughtEnv:
             results.append((next_state, 1.0)) # Every thought executed costs 1 step
         return results
 
-    def state_to_tensor(self, state: BWState, max_len: int = 150) -> torch.Tensor:
+    def state_to_text(self, state: BWState) -> str:
         """
-        Converts a text state into integers for the PyTorch heuristic network.
-        We concatenate [Init State] + [Goal State] + [Action 1] + [Action 2] ... 
-        so the network knows exactly what problem it's solving AND its current progress.
+        Converts a state into raw text for the LLM tokenizer.
         """
         text_parts = [self.current_instance["init"], self.current_instance["goal"]] + state.action_history
-        full_text = " ".join(text_parts).replace('\n', ' ')
-        words = full_text.split()
-        
-        # Translate words to IDs, capped at max_len
-        ids = [self.word2idx.get(w, self.word2idx["<UNK>"]) for w in words][:max_len]
-        
-        # Pad sequence so all tensors have identical dims
-        padded_ids = ids + [self.word2idx["<PAD>"]] * (max_len - len(ids))
-        
-        # Output shape: [1, max_len]
-        return torch.tensor(padded_ids).unsqueeze(0)
+        return " ".join(text_parts).replace('\n', ' ')
 
 
 # ==========================================
@@ -145,31 +137,42 @@ class BWThoughtEnv:
 class ThoughtHeurModel(nn.Module):
     """
     Predicts the Cost-to-Go (number of remaining thoughts to reach the goal).
-    Replaces the standard A* heuristic function.
+    Powered by a frozen 7B LLM and trainable LoRA adapters!
     """
-    def __init__(self, vocab_size: int, embedding_dim=16, hidden_dim=64, max_len=150):
+    def __init__(self, base_llm, tokenizer, max_len=256):
         super(ThoughtHeurModel, self).__init__()
-        # Word Embeddings scale our dynamically created vocabulary IDs into rich floats
-        self.embedding = nn.Embedding(num_embeddings=vocab_size, embedding_dim=embedding_dim, padding_idx=0)
+        self.base_llm = base_llm
+        self.tokenizer = tokenizer
+        self.max_len = max_len
         
-        # 1 Hidden layer. Input dim is fixed at max_seq_len * embedding_dim
-        self.fc1 = nn.Linear(embedding_dim * max_len, hidden_dim)
-        
-        # Output layer gives a singular float value (The Predicted Distance)
-        self.fc2 = nn.Linear(hidden_dim, 1)
-        self.relu = nn.ReLU()
+        # We define a single linear projection Value Head going from Llama-2's hidden dimension 4096 -> 1
+        # This will be trained alongside the LoRA adapters!
+        self.value_head = nn.Linear(4096, 1)
 
-    def forward(self, x):
-        # x is [Batch, Sequence_Len]
-        embedded = self.embedding(x) # [Batch, Seq, Emb]
+    def forward(self, thoughts_batch: list[str]):
+        # 1. Tokenize the batch of text strings
+        inputs = self.tokenizer(thoughts_batch, padding=True, truncation=True, 
+                                max_length=self.max_len, return_tensors="pt").to(self.base_llm.device)
         
-        # Flatten token embeddings into a single 1D vector per batch item
-        flattened = embedded.view(embedded.size(0), -1) 
+        # 2. Pass through the 7B LLM (with LoRA attached) to get the hidden state
+        # We request output_hidden_states to retrieve the feature vectors
+        outputs = self.base_llm(**inputs, output_hidden_states=True)
         
-        out = self.relu(self.fc1(flattened))
-        out = self.fc2(out)
+        # 3. Extract the last hidden state of the final token for each sequence in the batch
+        # shape: [Batch_size, Seq_length, 4096]
+        last_hidden_state = outputs.hidden_states[-1] 
         
-        # Enforce that remaining distance cannot be negative using ReLU!
+        # Gather based on attention mask to find the final non-padding token
+        seq_lengths = inputs['attention_mask'].sum(dim=1) - 1
+        batch_size = last_hidden_state.shape[0]
+        
+        # Shape: [Batch_size, 4096]
+        final_token_embeddings = last_hidden_state[torch.arange(batch_size), seq_lengths]
+        
+        # 4. Push through the final linear regression head
+        out = self.value_head(final_token_embeddings)
+        
+        # Enforce mathematical rule: Distance to goal cannot be negative
         return torch.relu(out)
 
 
@@ -212,8 +215,7 @@ class HeuristicTrainer:
         batch = random.sample(self.replay_buffer, batch_size)
         states, is_solved_list, neighbors_batch = zip(*batch)
         
-        # Assemble inputs from the batch
-        inputs = torch.cat([self.env.state_to_tensor(s) for s in states])
+        inputs_text = [self.env.state_to_text(s) for s in states]
         targets = []
         
         with torch.no_grad():
@@ -231,22 +233,25 @@ class HeuristicTrainer:
                         targets.append(10.0)
                         continue
                         
-                    n_inputs = torch.cat([self.env.state_to_tensor(ns) for ns in n_states])
+                    n_texts = [self.env.state_to_text(ns) for ns in n_states]
                     
                     # Q-Learning target = min(Cost_to_neighbor + Heuristic(neighbor))
-                    n_values = self.target_model(n_inputs).squeeze(-1).tolist()
+                    n_values = self.target_model(n_texts).squeeze(-1).tolist()
                     if isinstance(n_values, float):  # If only 1 neighbor, it returns float not list
                         n_values = [n_values]
                         
                     target_val = min([c + nv for c, nv in zip(n_costs, n_values)])
                     targets.append(target_val)
                     
-        targets_tensor = torch.tensor(targets).unsqueeze(1).float()
+        targets_tensor = torch.tensor(targets).unsqueeze(1).float().to(self.model.base_llm.device)
         
         # Forward and MSE Backprop
         self.model.train()
+        # Ensure LoRA adapters are trainable in the base model
+        self.model.base_llm.train()
+        
         self.optimizer.zero_grad()
-        predictions = self.model(inputs)
+        predictions = self.model(inputs_text)
         loss = self.criterion(predictions, targets_tensor)
         loss.backward()
         self.optimizer.step()
@@ -302,6 +307,10 @@ def main(
         model = ExLlamaModel(model_dir, lora_dir=None, device=device, 
                                 max_batch_size=n_candidate, max_new_tokens=200, 
                                 max_seq_length=2048, log_output=False)
+        
+        # ExLlamaModel.__init__ aggressively calls torch.set_grad_enabled(False) globally!
+        # We must turn it back on so our ThoughtHeurModel can compute gradients.
+        torch.set_grad_enabled(True)
     else:
         raise NotImplementedError(f"Model {base_lm} not fully integrated into train_v_heur script yet.")
 
@@ -316,6 +325,43 @@ def main(
         else:
             print(f"WARNING: The VAL environment variable is missing and could not be found at {val_path}.")
             
+    if base_lm == "hf":
+        from reasoners.lm.hf_model import HFModel
+        
+        print(f"Loading {model_dir} in 4-bit NF4 for PEFT LoRA training (Takes ~4.5GB VRAM)...")
+        # Load HuggingFace Model using 4-bit config via `quantized=nf4` built-into HFModel wrappers
+        hf_wrapper = HFModel(model_dir, model_dir, device="cuda:0", 
+                            max_batch_size=n_candidate, max_new_tokens=200, 
+                            quantized="nf4")
+        
+        # Extract the underlying AutoModelForCausalLM
+        base_llm = hf_wrapper.model
+        tokenizer = hf_wrapper.tokenizer
+        
+        # Ensure tokenizer padding is set correctly for sequence batching
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        print("Injecting LoRA Training Adapters using PEFT...")
+        # Wrap the LLM with LoRA Adapters
+        lora_config = LoraConfig(
+            r=8,
+            lora_alpha=16,
+            target_modules=["q_proj", "v_proj"],
+            lora_dropout=0.05,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM
+        )
+        peft_model = get_peft_model(base_llm, lora_config)
+        peft_model.print_trainable_parameters()
+        
+        # Hook the modified HuggingFace wrapper back into the ToT environment blocks
+        # (This will be used for `.generate()` in the exploration phase)
+        hf_wrapper.model = peft_model
+        model = hf_wrapper
+    else:
+        raise NotImplementedError("Only `--base_lm hf` is supported for LoRA heuristic training right now! Please use it.")
+        
     world_model = BlocksWorldModel(base_model=model, prompt=prompt, max_steps=max_steps)
     config = BWConfig(base_model=model, prompt=prompt, temperature=temperature, n_candidate=n_candidate)
     
@@ -350,9 +396,12 @@ def main(
         env._update_vocab(prob["init"])
         env._update_vocab(prob["goal"])
 
-    # Allocate Neural Net now that vocab size is firmly known
-    heur_model = ThoughtHeurModel(vocab_size=len(env.word2idx), max_len=150)
+    # Allocate Neural Net wrapped around the LoRA LLM
+    heur_model = ThoughtHeurModel(base_llm=peft_model, tokenizer=tokenizer, max_len=256)
+    heur_model.to(peft_model.device)
+    
     trainer = HeuristicTrainer(env, heur_model)
+    trainer.base_llm = peft_model # Pass reference to trainer for mode switching
 
     print("Beginning RL Epsilon-Greedy Random Walk...")
     
@@ -376,7 +425,9 @@ def main(
                 
             # EXPLORATION: Explore a random LLM thought
             if random.random() < epsilon:
-                actions = env.get_actions_cached(state)
+                # We temporarily disable the LoRA adapters so the LLM physically generated its base pre-trained thoughts!
+                with trainer.base_llm.disable_adapter():
+                    actions = env.get_actions_cached(state)
                 if not actions:
                     break
                 # choose random thought!
@@ -390,18 +441,20 @@ def main(
                 # If no thoughts available, we terminate the walk
                 if len(n_states) == 0:
                     break
-                    
+                
                 # Format thoughts for Neural Network Evaluation
-                n_inputs = torch.cat([env.state_to_tensor(ns) for ns in n_states])
+                n_texts = [env.state_to_text(ns) for ns in n_states]
                 
                 with torch.no_grad():
-                    n_values = trainer.target_model(n_inputs).squeeze(-1).tolist()
-                    if isinstance(n_values, float): n_values = [n_values]
+                    # Evaluate using the LoRA Network!
+                    with trainer.base_llm.enable_adapter():
+                        n_values = trainer.target_model(n_texts).squeeze(-1).tolist()
+                        if isinstance(n_values, float): n_values = [n_values]
                 
                 # Pick thought with MINIMUM predicted cost
                 best_idx = n_values.index(min(n_values))
                 # Expand neighbor 0 element is state, from that we extract the *last action* to execute
-                action = n_states[best_idx].action_history[-1] 
+                action = n_states[best_idx].action_history[-1]  
             
             # Formally take the step
             state, _ = env.world_model.step(state, action)
