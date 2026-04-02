@@ -139,7 +139,7 @@ class ThoughtHeurModel(nn.Module):
     Predicts the Cost-to-Go (number of remaining thoughts to reach the goal).
     Powered by a frozen 7B LLM and trainable LoRA adapters!
     """
-    def __init__(self, base_llm, tokenizer, max_len=256):
+    def __init__(self, base_llm, tokenizer, max_len=192): # Capped to 192 from 256 to save VRAM
         super(ThoughtHeurModel, self).__init__()
         self.base_llm = base_llm
         self.tokenizer = tokenizer
@@ -170,7 +170,10 @@ class ThoughtHeurModel(nn.Module):
         final_token_embeddings = last_hidden_state[torch.arange(batch_size), seq_lengths]
         
         # 4. Push through the final linear regression head
-        out = self.value_head(final_token_embeddings)
+        # Cast the float16/nf4 features from the base LLM back to the dtype (usually float32)
+        # of our trained Value Head to prevent precision mismatch matrix errors.
+        features = final_token_embeddings.to(self.value_head.weight.dtype)
+        out = self.value_head(features)
         
         # Enforce mathematical rule: Distance to goal cannot be negative
         return torch.relu(out)
@@ -184,11 +187,6 @@ class HeuristicTrainer:
         self.env = env
         self.model = model
         
-        # The Target network stabilizes Q-Learning by preventing a feedback loop. 
-        # It provides fixed target values.
-        self.target_model = copy.deepcopy(model)
-        self.target_model.eval()
-        
         self.optimizer = optim.Adam(model.parameters(), lr=lr)
         self.criterion = nn.MSELoss()
         
@@ -198,14 +196,14 @@ class HeuristicTrainer:
 
     def add_to_buffer(self, state: BWState):
         is_solved = self.env.is_goal(state)
-        neighbors = self.env.expand(state)
+        # ⚠️ Generation must ALWAYS use the base-model (no adapters)
+        with self.base_llm.disable_adapter():
+            neighbors = self.env.expand(state)
+            
         # We only save to memory if there are actually neighbors available
         if neighbors or is_solved: 
             self.replay_buffer.append((state, is_solved, neighbors))
 
-    def update_target_network(self):
-        """Syncs the stable target weights with the latest training weights."""
-        self.target_model.load_state_dict(self.model.state_dict())
 
     def train_step(self, batch_size=32):
         if len(self.replay_buffer) < batch_size:
@@ -219,29 +217,51 @@ class HeuristicTrainer:
         targets = []
         
         with torch.no_grad():
+            # Vectorized Target Calculation: Collate ALL neighbors from the entire batch!
+            # This turns 64+ forward passes into exactly 1.
+            all_neighbor_texts = []
+            neighbor_indices = [] # Map which neighbor belongs to which batch item
+            
+            for i, state in enumerate(states):
+                if not is_solved_list[i] and not self.env.is_terminal(state):
+                    n_states = [n[0] for n in neighbors_batch[i]]
+                    if n_states:
+                        all_neighbor_texts.extend([self.env.state_to_text(ns) for ns in n_states])
+                        neighbor_indices.append((i, len(n_states)))
+
+            # Perform exactly ONE vectorized forward pass for all candidates
+            all_n_values = []
+            if all_neighbor_texts:
+                self.model.eval()
+                # Run batch inference
+                all_n_values = self.model(all_neighbor_texts).squeeze(-1).tolist()
+                if isinstance(all_n_values, float): all_n_values = [all_n_values]
+
+            # Re-map results back to targets
+            val_ptr = 0
             for i, state in enumerate(states):
                 if is_solved_list[i]:
-                    targets.append(0.0) # Goal state has distance 0!
+                    targets.append(0.0)
                 elif self.env.is_terminal(state):
-                    targets.append(10.0) # Hit the step limit / hit a dead-end
+                    targets.append(10.0)
                 else:
-                    # Gather neighbor inputs
-                    n_states = [n[0] for n in neighbors_batch[i]]
-                    n_costs = [n[1] for n in neighbors_batch[i]]
+                    # Find candidates for this specific batch item
+                    n_count = 0
+                    for (idx, count) in neighbor_indices:
+                        if idx == i:
+                            n_count = count
+                            break
                     
-                    if len(n_states) == 0:
+                    if n_count == 0:
                         targets.append(10.0)
                         continue
                         
-                    n_texts = [self.env.state_to_text(ns) for ns in n_states]
+                    curr_n_values = all_n_values[val_ptr : val_ptr + n_count]
+                    n_costs = [n[1] for n in neighbors_batch[i]]
                     
-                    # Q-Learning target = min(Cost_to_neighbor + Heuristic(neighbor))
-                    n_values = self.target_model(n_texts).squeeze(-1).tolist()
-                    if isinstance(n_values, float):  # If only 1 neighbor, it returns float not list
-                        n_values = [n_values]
-                        
-                    target_val = min([c + nv for c, nv in zip(n_costs, n_values)])
+                    target_val = min([c + nv for c, nv in zip(n_costs, curr_n_values)])
                     targets.append(target_val)
+                    val_ptr += n_count
                     
         targets_tensor = torch.tensor(targets).unsqueeze(1).float().to(self.model.base_llm.device)
         
@@ -254,6 +274,10 @@ class HeuristicTrainer:
         predictions = self.model(inputs_text)
         loss = self.criterion(predictions, targets_tensor)
         loss.backward()
+        
+        # GRADIENT CLIPPING: Prevent weight explosion from unstable targets
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        
         self.optimizer.step()
         
         self.train_steps += 1
@@ -311,7 +335,7 @@ def main(
         # ExLlamaModel.__init__ aggressively calls torch.set_grad_enabled(False) globally!
         # We must turn it back on so our ThoughtHeurModel can compute gradients.
         torch.set_grad_enabled(True)
-    else:
+    elif base_lm != "hf":
         raise NotImplementedError(f"Model {base_lm} not fully integrated into train_v_heur script yet.")
 
     # ---------------------------------------------
@@ -327,6 +351,18 @@ def main(
             
     if base_lm == "hf":
         from reasoners.lm.hf_model import HFModel
+        
+        # Monkey-patch legacy PyTorch versions (< 1.13) to support modern transformers auto-quantization
+        # to guarantee `bitsandbytes` can inject its 4-bit Linear layers properly!
+        if not hasattr(torch.nn.Module, "set_submodule"):
+            def _set_submodule(self, target: str, module: torch.nn.Module) -> None:
+                atoms = target.split(".")
+                name = atoms.pop(-1)
+                mod = self
+                for item in atoms:
+                    mod = getattr(mod, item)
+                setattr(mod, name, module)
+            torch.nn.Module.set_submodule = _set_submodule
         
         print(f"Loading {model_dir} in 4-bit NF4 for PEFT LoRA training (Takes ~4.5GB VRAM)...")
         # Load HuggingFace Model using 4-bit config via `quantized=nf4` built-into HFModel wrappers
@@ -435,7 +471,10 @@ def main(
                 
             # EXPLOITATION: Ask heuristic which LLM thought yields the lowest remaining distance
             else:
-                neighbors = env.expand(state)
+                # IMPORTANT: Thoughts are ALWAYS generated by the base-model (no adapters)
+                with trainer.base_llm.disable_adapter():
+                    neighbors = env.expand(state)
+                    
                 n_states = [n[0] for n in neighbors]
                 
                 # If no thoughts available, we terminate the walk
@@ -446,10 +485,10 @@ def main(
                 n_texts = [env.state_to_text(ns) for ns in n_states]
                 
                 with torch.no_grad():
-                    # Evaluate using the LoRA Network!
-                    with trainer.base_llm.enable_adapter():
-                        n_values = trainer.target_model(n_texts).squeeze(-1).tolist()
-                        if isinstance(n_values, float): n_values = [n_values]
+                    # Evaluate using the LoRA Network! (Enabled by default)
+                    trainer.model.eval()
+                    n_values = trainer.model(n_texts).squeeze(-1).tolist()
+                    if isinstance(n_values, float): n_values = [n_values]
                 
                 # Pick thought with MINIMUM predicted cost
                 best_idx = n_values.index(min(n_values))
@@ -458,16 +497,19 @@ def main(
             
             # Formally take the step
             state, _ = env.world_model.step(state, action)
-            
-        # Update Target network weights conservatively
-        if trainer.train_steps % 50 == 0:
-            trainer.update_target_network()
 
         # Step the gradients!
         loss = trainer.train_step(batch_size=batch_size)
         
         if ep % 2 == 0:
             print(f"Episode {ep:03d} | Loss: {loss if loss else 0.0:.4f} | Epsilon: {epsilon:.2f} | Local Vocab: {len(env.word2idx)} words")
+
+        # PERIODIC MEMORY CLEANUP HOOK
+        # Every 10 episodes, flush the CUDA cache and clean up fragmented tensors
+        if ep % 10 == 0:
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
 
     print(f"\nTraining Complete! Saving final Model Weights to {run_dir}/heur_model.pth")
     torch.save(heur_model.state_dict(), os.path.join(run_dir, "heur_model.pth"))
