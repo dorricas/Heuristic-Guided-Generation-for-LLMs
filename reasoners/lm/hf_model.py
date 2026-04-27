@@ -45,16 +45,17 @@ class HFModel(LanguageModel):
                 load_in_4bit=True,
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type=quantized,
-                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_compute_dtype=torch.float16, # MANDATORY: float16 for 1080Ti/12GB card compatibility
             )
 
-            print("quantizing.............................")
+            print(f"Loading {model_pth} in 4-bit {quantized} (Lean Mode for 12GB GPUs)...")
 
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_pth,
                 quantization_config=bnb_config,
                 device_map="auto",
-                trust_remote_code=True
+                trust_remote_code=True,
+                low_cpu_mem_usage=True # CRITICAL: Prevents 14GB materialization crash on 11GB/12GB cards
             )
         
         elif quantized == "awq":
@@ -164,7 +165,6 @@ class HFModel(LanguageModel):
         )
         if max_new_tokens is not None:
             generation_config = GenerationConfig(
-            max_length=max_length,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             pad_token_id=self.tokenizer.pad_token_id,

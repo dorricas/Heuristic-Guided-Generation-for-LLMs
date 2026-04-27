@@ -297,7 +297,7 @@ if __name__ == '__main__':
             model = ExLlamaModel(model_dir, 
                                     lora_dir, 
                                     device=device, 
-                                    max_batch_size=1, 
+                                    max_batch_size=batch_size, 
                                     max_new_tokens=200, 
                                     max_seq_length=2048, 
                                     mem_map=mem_map,

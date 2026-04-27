@@ -4,6 +4,7 @@ import copy
 import json
 import random
 import datetime
+import time
 from collections import deque
 import logging
 import contextlib
@@ -11,6 +12,7 @@ import contextlib
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import fire
 from peft import get_peft_model, LoraConfig, TaskType
 
@@ -41,18 +43,13 @@ class BWThoughtEnv:
         # thought_cache maps a unique state signature to a list of possible thought strings proposed by the LLM
         self.thought_cache = {} 
         
-        # --- Dynamic Text Tokenizer ---
-        # Since thoughts are physical words, we build a lightweight dynamic dictionary mapping words to IDs
-        # so we can pass integer tensors into our Heuristic Neural Network.
-        self.word2idx = {"<PAD>": 0, "<UNK>": 1}
-        self.idx2word = {0: "<PAD>", 1: "<UNK>"}
-        
         self.current_instance = None # Holds the active training problem
         self.current_prompt = None
 
     def reset(self, instance: dict):
         """Resets the environment to a specific BlocksWorld training problem."""
         self.current_instance = instance
+        self.thought_cache = {} # CLEAR CACHE FOR NEW PROBLEM!!
         
         # 1. Ask the evaluator to randomly sample few-shot examples and build the complex prompt template
         self.current_prompt = self.evaluator.sample_prompt(shuffle_prompt=True, num_shot=4)
@@ -60,11 +57,7 @@ class BWThoughtEnv:
         # 2. Bind the active problem and the prompt framework to the action-generator (config)
         self.config.update_example(instance, prompt=self.current_prompt)
         
-        # 3. Update our Neural Network vocabulary with words from the initial and goal states
-        self._update_vocab(instance["init"])
-        self._update_vocab(instance["goal"])
-        
-        # 4. Return the starting state (Step 0, clean action history)
+        # 3. Return the starting state (Step 0, clean action history)
         return self.world_model.init_state()
 
     def get_actions_cached(self, state: BWState):
@@ -79,40 +72,71 @@ class BWThoughtEnv:
             # Query the LLM (Very Expensive operation)
             actions = self.config.get_actions(state)
             self.thought_cache[state_key] = actions
-            
-            # Immediately add any new words from the LLM's thoughts to our tokenizer dictionary
-            for act in actions:
-                self._update_vocab(act)
                 
         return self.thought_cache[state_key]
 
-    def _update_vocab(self, text: str):
-        """Helper to break a text sequence into words and map them to unqiue integer IDs."""
-        words = text.replace('\n', ' ').split()
-        for w in words:
-            if w not in self.word2idx:
-                idx = len(self.word2idx)
-                self.word2idx[w] = idx
-                self.idx2word[idx] = w
-
-    def is_goal(self, state: BWState) -> bool:
-        """
-        Uses the internal validation script to determine mathematically if the block placements
-        satisfy the goal requirements for the current problem dataset.
-        """
-        if len(state.action_history) == 0:
-            return False
+    def simulate_world(self, action_history, instance=None):
+        """Helper to simulate the block world state from a list of NL actions.
+        Strictly enforces Blocksworld physics preconditions - invalid LLM actions are silently skipped."""
+        target_instance = instance if instance else self.current_instance
+        if not target_instance:
+            return {}, None
             
-        output_plan = "\n".join(state.action_history) + "\n"
-        # BWEvaluator returns True if the output_plan legitimately solves the current instance
-        # Suppress the incredibly messy C++ prints so it doesn't spam your terminal!
-        with open(os.devnull, 'w') as f, contextlib.redirect_stdout(f):
-            correct = self.evaluator.eval_output(self.current_instance, output_plan)
-        return correct
+        init_str = target_instance["init"].lower()
+        import re
+        blocks = list(set(re.findall(r'the (\w+) block', init_str)))
+        world = {}
+        held = None
 
-    def is_terminal(self, state: BWState) -> bool:
+        for block in blocks:
+            if f"the {block} block is on top of" in init_str:
+                m = re.search(rf"the {block} block is on top of the (\w+) block", init_str)
+                if m: world[block] = m.group(1)
+            else:
+                world[block] = "table"
+
+        for action in action_history:
+            action = action.lower().strip()
+            # A block is clear if no other block in the world is sitting on top of it
+            clear = {b for b in world if not any(world.get(o) == b for o in world)}
+
+            if "pick up the" in action:
+                m = re.search(r"pick up the (\w+) block", action)
+                if m:
+                    block = m.group(1)
+                    # Preconditions: hand empty, block on table, block is clear
+                    if held is None and world.get(block) == "table" and block in clear:
+                        world[block] = "hand"
+                        held = block
+            elif "put down the" in action:
+                m = re.search(r"put down the (\w+) block", action)
+                if m:
+                    block = m.group(1)
+                    # Preconditions: hand is holding this block
+                    if held == block:
+                        world[block] = "table"
+                        held = None
+            elif "unstack the" in action:
+                m = re.search(r"unstack the (\w+) block from on top of the (\w+) block", action)
+                if m:
+                    block, from_block = m.group(1), m.group(2)
+                    # Preconditions: hand empty, block is on from_block, block is clear
+                    if held is None and world.get(block) == from_block and block in clear:
+                        world[block] = "hand"
+                        held = block
+            elif "stack the" in action:
+                m = re.search(r"stack the (\w+) block on top of the (\w+) block", action)
+                if m:
+                    block, onto = m.group(1), m.group(2)
+                    # Preconditions: hand holding block, target block is clear
+                    if held == block and onto in clear:
+                        world[block] = onto
+                        held = None
+        return world, held
+
+    def is_terminal(self, state: BWState, instance=None) -> bool:
         """A state is a dead-end if we reached the step limit or already solved the problem."""
-        return self.world_model.is_terminal(state) or self.is_goal(state)
+        return self.world_model.is_terminal(state) or self.is_goal(state, instance)
 
     def expand(self, state: BWState) -> list:
         """Returns a list of tuples (next_state, step_cost) for all possible thoughts from the LLM."""
@@ -123,13 +147,67 @@ class BWThoughtEnv:
             results.append((next_state, 1.0)) # Every thought executed costs 1 step
         return results
 
-    def state_to_text(self, state: BWState) -> str:
+    def is_goal(self, state: BWState, instance=None) -> bool:
+        """Pure Python Blocksworld goal checker.
+        
+        Checks ALL goal condition types:
+          - 'the X block is on top of the Y block'
+          - 'the X block is on the table'
+          - 'the hand is empty'
+        A state is a goal ONLY when every condition is satisfied.
         """
-        Converts a state into raw text for the LLM tokenizer.
-        """
-        text_parts = [self.current_instance["init"], self.current_instance["goal"]] + state.action_history
-        return " ".join(text_parts).replace('\n', ' ')
+        target_instance = instance if instance else self.current_instance
+        if not target_instance or len(state.action_history) == 0:
+            return False
+            
+        world, held = self.simulate_world(state.action_history, instance)
+        goal_str = target_instance["goal"].lower()
+        import re
 
+        found_any_condition = False
+
+        # Condition type 1: "the X block is on top of the Y block"
+        on_top_conditions = re.findall(r'the (\w+) block is on top of the (\w+) block', goal_str)
+        for upper, lower in on_top_conditions:
+            found_any_condition = True
+            if world.get(upper) != lower:
+                return False
+
+        # Condition type 2: "the X block is on the table"
+        on_table_conditions = re.findall(r'the (\w+) block is on the table', goal_str)
+        for block in on_table_conditions:
+            found_any_condition = True
+            if world.get(block) != "table":
+                return False
+
+        # Condition type 3: "the hand is empty"
+        if "the hand is empty" in goal_str:
+            found_any_condition = True
+            if held is not None:
+                return False
+
+        # Safety: if no recognized conditions were found, do not falsely claim goal
+        if not found_any_condition:
+            return False
+
+        return True
+
+    def state_to_text(self, state: BWState, instance=None) -> str:
+        """Converts current world state into a clean physical description."""
+        world, held = self.simulate_world(state.action_history, instance)
+        
+        # Build a flat string of positions: "the red block is on the table, the blue block is on red..."
+        parts = []
+        for b, pos in world.items():
+            if pos == "table": parts.append(f"the {b} block is on the table")
+            elif pos == "hand": parts.append(f"the {b} block is in the hand")
+            else: parts.append(f"the {b} block is on top of the {pos} block")
+            
+        current_state_str = ", ".join(parts)
+        target_instance = instance if instance else self.current_instance
+        # FLIPPED: Put the Goal at the END so its information is closest to the last-token embedding
+        text = f"Current State: {current_state_str} | Goal: {target_instance['goal']}"
+        return text
 
 # ==========================================
 # 2. NEURAL NETWORK ARCHITECTURE
@@ -146,10 +224,17 @@ class ThoughtHeurModel(nn.Module):
         self.max_len = max_len
         
         # We define a single linear projection Value Head going from Llama-2's hidden dimension 4096 -> 1
-        # This will be trained alongside the LoRA adapters!
         self.value_head = nn.Linear(4096, 1)
+        
+        # STABILITY INIT: Initialize with bias 2.0 (down from 5.0) 
+        # to make it easier to reach the 0.0 goal state targets.
+        nn.init.xavier_uniform_(self.value_head.weight)
+        nn.init.constant_(self.value_head.bias, 2.0)
 
     def forward(self, thoughts_batch: list[str]):
+        # Enforce right-padding so the final token aligns correctly with the attention_mask computation
+        self.tokenizer.padding_side = 'right'
+
         # 1. Tokenize the batch of text strings
         inputs = self.tokenizer(thoughts_batch, padding=True, truncation=True, 
                                 max_length=self.max_len, return_tensors="pt").to(self.base_llm.device)
@@ -159,15 +244,15 @@ class ThoughtHeurModel(nn.Module):
         outputs = self.base_llm(**inputs, output_hidden_states=True)
         
         # 3. Extract the last hidden state of the final token for each sequence in the batch
-        # shape: [Batch_size, Seq_length, 4096]
-        last_hidden_state = outputs.hidden_states[-1] 
+        # shape: [Batch_size, Sequence_Length, Features (4096)]
+        final_layer_features = outputs.hidden_states[-1] 
         
         # Gather based on attention mask to find the final non-padding token
         seq_lengths = inputs['attention_mask'].sum(dim=1) - 1
-        batch_size = last_hidden_state.shape[0]
+        batch_size = final_layer_features.shape[0]
         
         # Shape: [Batch_size, 4096]
-        final_token_embeddings = last_hidden_state[torch.arange(batch_size), seq_lengths]
+        final_token_embeddings = final_layer_features[torch.arange(batch_size), seq_lengths]
         
         # 4. Push through the final linear regression head
         # Cast the float16/nf4 features from the base LLM back to the dtype (usually float32)
@@ -176,22 +261,32 @@ class ThoughtHeurModel(nn.Module):
         out = self.value_head(features)
         
         # Enforce mathematical rule: Distance to goal cannot be negative
-        return torch.relu(out)
+        # return F.relu(out)
+        return out
 
 
 # ==========================================
 # 3. TRAINING LOOP
 # ==========================================
 class HeuristicTrainer:
-    def __init__(self, env: BWThoughtEnv, model: ThoughtHeurModel, lr=1e-3):
+    def __init__(self, env: BWThoughtEnv, model: ThoughtHeurModel, lr=1e-4): 
         self.env = env
         self.model = model
         
-        self.optimizer = optim.Adam(model.parameters(), lr=lr)
-        self.criterion = nn.MSELoss()
+        # PARAM-SPECIFIC LEARNING RATES:
+        # We give the Value Head a MUCH higher LR than the LoRA adapters
+        # so it can map features to distances aggressively.
+        self.optimizer = optim.Adam([
+            {'params': model.value_head.parameters(), 'lr': lr}, # 1e-4
+            {'params': model.base_llm.parameters(), 'lr': lr * 0.1} # 1e-5 (LoRA)
+        ], weight_decay=0.001)
+        
+        self.criterion = nn.SmoothL1Loss(beta=2.0) # Tighter quadratic window (error=2.0)
         
         # Memory bank mapping transitions (State, is_solved, neighbors)
-        self.replay_buffer = deque(maxlen=50000) 
+        # We split the buffer to ensure we always have "Grounding" (Goal) examples in every batch
+        self.buffer_pos = deque(maxlen=20000) # Goals or Goal-Adjacent
+        self.buffer_neg = deque(maxlen=30000) # Everything else
         self.train_steps = 0
 
     def add_to_buffer(self, state: BWState):
@@ -200,20 +295,44 @@ class HeuristicTrainer:
         with self.base_llm.disable_adapter():
             neighbors = self.env.expand(state)
             
+        # EXPLICITLY ADD ANY DISCOVERED GOAL STATES TO POSITIVE BUFFER
+        # This guarantees the model sees `0.0` examples!
+        # ATTACH INSTANCE to prevent cross-pollution during evaluation!
+        for n_state, _ in neighbors:
+            if self.env.is_goal(n_state):
+                self.buffer_pos.append((n_state, True, [], self.env.current_instance))
+
+        any_neighbor_is_goal = any([self.env.is_goal(n[0]) for n in neighbors])
+        
         # We only save to memory if there are actually neighbors available
         if neighbors or is_solved: 
-            self.replay_buffer.append((state, is_solved, neighbors))
+            entry = (state, is_solved, neighbors, self.env.current_instance)
+            if is_solved or any_neighbor_is_goal:
+                self.buffer_pos.append(entry)
+            else:
+                self.buffer_neg.append(entry)
 
 
     def train_step(self, batch_size=32):
-        if len(self.replay_buffer) < batch_size:
+        if (len(self.buffer_pos) + len(self.buffer_neg)) < batch_size:
             return None
             
-        # Sample mini-batch randomly
-        batch = random.sample(self.replay_buffer, batch_size)
-        states, is_solved_list, neighbors_batch = zip(*batch)
+        # PRIORITY SAMPLING: 50% from Positive Buffer, 50% from Negative
+        # We need to "scream" the goal signal (50% of batch) to drown out the garbage states.
+        n_pos = min(len(self.buffer_pos), batch_size // 2)
+        n_neg = batch_size - n_pos
         
-        inputs_text = [self.env.state_to_text(s) for s in states]
+        # Safely pull overflow from pos_buffer if neg_buffer hasn't populated entirely yet
+        if n_neg > len(self.buffer_neg):
+            n_neg = len(self.buffer_neg)
+            n_pos = batch_size - n_neg
+        
+        batch = random.sample(self.buffer_pos, n_pos) + random.sample(self.buffer_neg, n_neg)
+        random.shuffle(batch)
+        
+        states, is_solved_list, neighbors_batch, instances_batch = zip(*batch)
+        
+        inputs_text = [self.env.state_to_text(s, inst) for s, inst in zip(states, instances_batch)]
         targets = []
         
         with torch.no_grad():
@@ -223,27 +342,26 @@ class HeuristicTrainer:
             neighbor_indices = [] # Map which neighbor belongs to which batch item
             
             for i, state in enumerate(states):
-                if not is_solved_list[i] and not self.env.is_terminal(state):
-                    n_states = [n[0] for n in neighbors_batch[i]]
-                    if n_states:
-                        all_neighbor_texts.extend([self.env.state_to_text(ns) for ns in n_states])
-                        neighbor_indices.append((i, len(n_states)))
+                if not is_solved_list[i]:
+                    neighbor_states = [neighbor[0] for neighbor in neighbors_batch[i]]
+                    if neighbor_states:
+                        all_neighbor_texts.extend([self.env.state_to_text(ns, instances_batch[i]) for ns in neighbor_states])
+                        neighbor_indices.append((i, len(neighbor_states)))
 
             # Perform exactly ONE vectorized forward pass for all candidates
-            all_n_values = []
+            all_neighbor_values = []
             if all_neighbor_texts:
                 self.model.eval()
                 # Run batch inference
-                all_n_values = self.model(all_neighbor_texts).squeeze(-1).tolist()
-                if isinstance(all_n_values, float): all_n_values = [all_n_values]
+                all_neighbor_values = self.model(all_neighbor_texts).squeeze(-1).tolist()
+                if isinstance(all_neighbor_values, float):
+                    all_neighbor_values = [all_neighbor_values]
 
             # Re-map results back to targets
             val_ptr = 0
             for i, state in enumerate(states):
                 if is_solved_list[i]:
                     targets.append(0.0)
-                elif self.env.is_terminal(state):
-                    targets.append(10.0)
                 else:
                     # Find candidates for this specific batch item
                     n_count = 0
@@ -253,13 +371,22 @@ class HeuristicTrainer:
                             break
                     
                     if n_count == 0:
-                        targets.append(10.0)
+                        # True dead end (LLM proposed zero actions), give massive penalty
+                        targets.append(50.0)
                         continue
                         
-                    curr_n_values = all_n_values[val_ptr : val_ptr + n_count]
+                    curr_n_values = all_neighbor_values[val_ptr : val_ptr + n_count]
                     n_costs = [n[1] for n in neighbors_batch[i]]
+                    # Check if any neighbor is physically the goal
+                    n_is_goal = [self.env.is_goal(n[0], instances_batch[i]) for n in neighbors_batch[i]]
                     
-                    target_val = min([c + nv for c, nv in zip(n_costs, curr_n_values)])
+                    # GROUNDING: If any neighbor is the goal, the target is exactly the step cost (1.0)
+                    if any(n_is_goal):
+                        target_val = 1.0
+                    else:
+                        # ADI CORE: target = min(neighbor_cost + predicted_neighbor_value)
+                        target_val = min([c + nv for c, nv in zip(n_costs, curr_n_values)])
+                        
                     targets.append(target_val)
                     val_ptr += n_count
                     
@@ -276,12 +403,20 @@ class HeuristicTrainer:
         loss.backward()
         
         # GRADIENT CLIPPING: Prevent weight explosion from unstable targets
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        # clip_grad_norm_ mathematically returns the true unclipped gradient norm!
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0).item()
         
         self.optimizer.step()
         
+        # MONITORING: Calculate Value Variance to see if the model is "dead"
+        with torch.no_grad():
+            v_std = predictions.std().item()
+            v_mean = predictions.mean().item()
+            v_min = predictions.min().item()
+            v_max = predictions.max().item()
+        
         self.train_steps += 1
-        return loss.item()
+        return loss.item(), (v_mean, v_std, v_min, v_max, grad_norm)
 
 
 # ==========================================
@@ -299,8 +434,9 @@ def main(
     n_candidate: int = 4,                   
     max_episodes: int = 20,                
     use_cache: bool = True,                 
-    max_steps: int = 6,
-    temperature: float = 0.8
+    max_steps: int = 10,
+    temperature: float = 0.8,
+    save_model_every: int = None
 ):
     # ---------------------------------------------
     # SETUP LOGGING AND DIRS
@@ -425,12 +561,6 @@ def main(
     # INITIALIZE RL ENVIRONMENT AND HEUR TRAINER
     # ---------------------------------------------
     env = BWThoughtEnv(world_model, config, evaluator, use_cache=use_cache)
-    
-    # Pre-build our environment vocabulary from all problems in the train test!
-    # Because our network needs a fixed vocabulary at start, we inject all init/goal strings.
-    for prob in train_data + test_data:
-        env._update_vocab(prob["init"])
-        env._update_vocab(prob["goal"])
 
     # Allocate Neural Net wrapped around the LoRA LLM
     heur_model = ThoughtHeurModel(base_llm=peft_model, tokenizer=tokenizer, max_len=256)
@@ -444,6 +574,13 @@ def main(
     # ---------------------------------------------
     # TRAINING LOOP
     # ---------------------------------------------
+    start_time = time.time()
+    last_log_time = start_time
+    
+    history_loss = []
+    history_heur_mean = []
+    
+    goals_reached = 0   # Counts goal reached in the last log window (2 episodes)
     for ep in range(max_episodes):
         # 1. Epsilon decay (more random at start, greedier at end)
         epsilon = max(0.1, 1.0 - (ep / (max_episodes * 0.5)))
@@ -498,25 +635,92 @@ def main(
             # Formally take the step
             state, _ = env.world_model.step(state, action)
 
+        # Track if this episode ended at the goal
+        if env.is_goal(state):
+            goals_reached += 1
+
         # Step the gradients!
-        loss = trainer.train_step(batch_size=batch_size)
+        res = trainer.train_step(batch_size=batch_size)
+        if res:
+            loss, (v_mean, v_std, v_min, v_max, grad_norm) = res
+        else:
+            loss, v_mean, v_std, v_min, v_max, grad_norm = 0, 0, 0, 0, 0, 0
+            
+        history_loss.append(loss)
+        history_heur_mean.append(v_mean)
         
         if ep % 2 == 0:
-            print(f"Episode {ep:03d} | Loss: {loss if loss else 0.0:.4f} | Epsilon: {epsilon:.2f} | Local Vocab: {len(env.word2idx)} words")
+            current_time = time.time()
+            elapsed_since_log = current_time - last_log_time
+            total_elapsed = current_time - start_time
+            
+            avg_time_per_ep = total_elapsed / max(1, ep)
+            est_remaining = avg_time_per_ep * (max_episodes - ep - 1)
+            est_rem_str = str(datetime.timedelta(seconds=int(est_remaining)))
+            
+            print(f"Episode {ep:03d} | Loss: {loss:.3f} | Grad: {grad_norm:.2f} | Range: [{v_min:.1f}-{v_max:.1f}] | Std: {v_std:.2f} | Goals: {goals_reached}/2 | Time/2Ep: {elapsed_since_log:.1f}s | Est. Rem: {est_rem_str}")
+            
+            goals_reached = 0  # Reset window counter
+            last_log_time = current_time
 
-        # PERIODIC MEMORY CLEANUP HOOK
-        # Every 10 episodes, flush the CUDA cache and clean up fragmented tensors
-        if ep % 10 == 0:
-            import gc
-            gc.collect()
-            torch.cuda.empty_cache()
+        if save_model_every is not None and ep > 0 and ep % save_model_every == 0:
+            chkpt_dir = os.path.join(run_dir, "checkpoints")
+            os.makedirs(chkpt_dir, exist_ok=True)
+            chkpt_path = os.path.join(chkpt_dir, f"heur_model_ep{ep:05d}.pth")
+            trainable_state_dict = {k: v for k, v in heur_model.state_dict().items() if "lora" in k or "value_head" in k}
+            torch.save(trainable_state_dict, chkpt_path)
+            print(f"  [>] Saved intermediate checkpoint to: {chkpt_path}")
 
     print(f"\nTraining Complete! Saving final Model Weights to {run_dir}/heur_model.pth")
-    torch.save(heur_model.state_dict(), os.path.join(run_dir, "heur_model.pth"))
+    # ONLY save the Trainable parameters (LoRA adapters + Value Head) to save 4.5GB of disk space!
+    trainable_state_dict = {k: v for k, v in heur_model.state_dict().items() if "lora" in k or "value_head" in k}
+    torch.save(trainable_state_dict, os.path.join(run_dir, "heur_model.pth"))
     
-    # Save the dictionary so future usages know how to map words -> IDs
-    with open(os.path.join(run_dir, "vocab.json"), "w") as f:
-        json.dump(env.word2idx, f, indent=2)
+    # ---------------------------------------------
+    # SAVE TRAINING GRAPHS
+    # ---------------------------------------------
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        window = min(50, len(history_loss))
+        if window > 1:
+            smooth_loss = np.convolve(history_loss, np.ones(window)/window, mode='valid')
+            smooth_heur = np.convolve(history_heur_mean, np.ones(window)/window, mode='valid')
+            x_axis = range(window - 1, len(history_loss))
+        else:
+            smooth_loss = history_loss
+            smooth_heur = history_heur_mean
+            x_axis = range(len(history_loss))
+        
+        # 1. Loss Graph
+        plt.figure(figsize=(10, 5))
+        plt.plot(range(len(history_loss)), history_loss, alpha=0.3, label="Raw Batch Loss", color="blue")
+        plt.plot(x_axis, smooth_loss, label=f"Smoothed Loss (Window={window})", color="blue", linewidth=2.0)
+        plt.xlabel("Updates")
+        plt.ylabel("Loss")
+        plt.title("Neural Network Loss Over Time")
+        plt.grid(True, linestyle="--", alpha=0.6)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(run_dir, "plot_loss.png"))
+        plt.close()
+        
+        # 2. Heuristics Average Graph
+        plt.figure(figsize=(10, 5))
+        plt.plot(range(len(history_heur_mean)), history_heur_mean, alpha=0.3, label="Raw Batch Mean", color="orange")
+        plt.plot(x_axis, smooth_heur, label=f"Smoothed Mean (Window={window})", color="darkorange", linewidth=2.0)
+        plt.xlabel("Updates")
+        plt.ylabel("Mean Heuristic Validated Value")
+        plt.title("Average Heuristic Prediction Over Time")
+        plt.grid(True, linestyle="--", alpha=0.6)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(run_dir, "plot_heur_mean.png"))
+        plt.close()
+        print("Successfully saved Loss and Heuristic graphs as PNGs.")
+    except Exception as e:
+        print(f"Could not save training graphs (matplotlib may not be installed): {e}")
         
 
 if __name__ == '__main__':
