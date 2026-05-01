@@ -228,8 +228,9 @@ class ThoughtHeurModel(nn.Module):
         
         # STABILITY INIT: Initialize with bias 2.0 (down from 5.0) 
         # to make it easier to reach the 0.0 goal state targets.
+        # No artificial bias. Let the model start from 0 and grow naturally.
         nn.init.xavier_uniform_(self.value_head.weight)
-        nn.init.constant_(self.value_head.bias, 2.0)
+        nn.init.zeros_(self.value_head.bias)
 
     def forward(self, thoughts_batch: list[str]):
         # Enforce right-padding so the final token aligns correctly with the attention_mask computation
@@ -256,12 +257,10 @@ class ThoughtHeurModel(nn.Module):
         
         # 4. Push through the final linear regression head
         # Cast the float16/nf4 features from the base LLM back to the dtype (usually float32)
-        # of our trained Value Head to prevent precision mismatch matrix errors.
         features = final_token_embeddings.to(self.value_head.weight.dtype)
         out = self.value_head(features)
-        
-        # Enforce mathematical rule: Distance to goal cannot be negative
-        # return F.relu(out)
+        # Pure linear regression. We allow negative outputs during training so gradients never die,
+        # and the MSE loss will naturally pull them to the true positive targets (0, 1, 2...).
         return out
 
 
@@ -281,7 +280,9 @@ class HeuristicTrainer:
             {'params': model.base_llm.parameters(), 'lr': lr * 0.1} # 1e-5 (LoRA)
         ], weight_decay=0.001)
         
-        self.criterion = nn.SmoothL1Loss(beta=2.0) # Tighter quadratic window (error=2.0)
+        # We use SmoothL1Loss (Huber) to prevent the large values (15-20) from dominating the gradients.
+        # This allows the network to dedicate equal capacity to making the Goal (0.0) and 1-step (1.0) highly precise.
+        self.criterion = nn.SmoothL1Loss(beta=1.0)
         
         # Memory bank mapping transitions (State, is_solved, neighbors)
         # We split the buffer to ensure we always have "Grounding" (Goal) examples in every batch
@@ -371,8 +372,8 @@ class HeuristicTrainer:
                             break
                     
                     if n_count == 0:
-                        # True dead end (LLM proposed zero actions), give massive penalty
-                        targets.append(50.0)
+                        # True dead end (LLM proposed zero actions). Give a realistic max penalty instead of 50.
+                        targets.append(15.0)
                         continue
                         
                     curr_n_values = all_neighbor_values[val_ptr : val_ptr + n_count]
@@ -384,8 +385,11 @@ class HeuristicTrainer:
                     if any(n_is_goal):
                         target_val = 1.0
                     else:
-                        # ADI CORE: target = min(neighbor_cost + predicted_neighbor_value)
-                        target_val = min([c + nv for c, nv in zip(n_costs, curr_n_values)])
+                        # ADI CORE: target = min(neighbor_cost + gamma * predicted_neighbor_value)
+                        # gamma=0.95 acts as a natural decay, stopping the value drift to 70+
+                        # so the MSE loss can focus on making Goal (0.0) and 1-step (1.0) highly accurate.
+                        target_val = min([c + 0.95 * nv for c, nv in zip(n_costs, curr_n_values)])
+                        
                         
                     targets.append(target_val)
                     val_ptr += n_count
@@ -406,7 +410,12 @@ class HeuristicTrainer:
         # clip_grad_norm_ mathematically returns the true unclipped gradient norm!
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0).item()
         
-        self.optimizer.step()
+        # NaN PROTECTION: If loss or gradients become NaN, prevent weights from being corrupted
+        import math
+        if math.isnan(grad_norm) or math.isinf(grad_norm):
+            self.optimizer.zero_grad()
+        else:
+            self.optimizer.step()
         
         # MONITORING: Calculate Value Variance to see if the model is "dead"
         with torch.no_grad():
