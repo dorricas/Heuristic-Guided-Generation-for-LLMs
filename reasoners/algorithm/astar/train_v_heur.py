@@ -312,6 +312,54 @@ class HeuristicTrainer:
                 self.buffer_pos.append(entry)
             else:
                 self.buffer_neg.append(entry)
+                
+        return neighbors
+
+    def perform_her(self, episode_history, instance):
+        """
+        HINDSIGHT EXPERIENCE REPLAY (HER)
+        If the agent wandered for N steps and failed to find the true goal, we pretend the 
+        final state it reached WAS the goal! We dynamically generate a 'fake' goal string 
+        and re-evaluate the entire episode, flooding the replay buffer with perfect 
+        0, 1, 2, 3.. distance labels for the Neural Network to learn from.
+        """
+        if not episode_history: return
+        
+        # 1. Look at the final state of the failed episode
+        final_state = episode_history[-1][0]
+        
+        # 2. Parse the final state to see what physical block relationships exist
+        world, held = self.env.simulate_world(final_state.action_history, instance)
+        
+        # Find any "on top of" relationships (we ignore blocks on the table)
+        on_top_rels = [(b, target) for b, target in world.items() if target not in ('table', 'hand')]
+        if not on_top_rels: 
+            return # The final state is just blocks on a table, nothing meaningful to learn.
+            
+        # 3. Construct a 'Fake' Goal String from these relationships
+        # Randomly pick 1 or 2 relationships to form the fake goal
+        import random
+        num_goals = random.choice([1, 2]) if len(on_top_rels) >= 2 else 1
+        chosen_rels = random.sample(on_top_rels, num_goals)
+        
+        goal_parts = [f"the {b} block is on top of the {t} block" for b, t in chosen_rels]
+        fake_goal_str = " and ".join(goal_parts)
+        
+        # 4. Create a Fake Instance
+        fake_instance = instance.copy()
+        fake_instance["goal"] = fake_goal_str
+        
+        # 5. Re-evaluate the episode using the fake goal and add to Replay Buffer!
+        for state, neighbors in episode_history:
+            # Re-calculate 'is_solved' using the fake goal
+            is_solved = self.env.is_goal(state, fake_instance)
+            any_neighbor_is_goal = any([self.env.is_goal(n[0], fake_instance) for n in neighbors])
+            
+            entry = (state, is_solved, neighbors, fake_instance)
+            if is_solved or any_neighbor_is_goal:
+                self.buffer_pos.append(entry)
+            else:
+                self.buffer_neg.append(entry)
 
 
     def train_step(self, batch_size=32):
@@ -597,10 +645,12 @@ def main(
         # 2. Pick a random problem instance to practice solving
         instance = random.choice(train_data)
         state = env.reset(instance)
+        episode_history = []
         
         while True:
             # Replay buffer observation happens BEFORE taking an action
-            trainer.add_to_buffer(state)
+            neighbors = trainer.add_to_buffer(state)
+            episode_history.append((state, neighbors))
             
             if env.is_terminal(state):
                 break
@@ -647,6 +697,10 @@ def main(
         # Track if this episode ended at the goal
         if env.is_goal(state):
             goals_reached += 1
+        else:
+            # FAILED TO REACH GOAL! 
+            # We use Hindsight Experience Replay (HER) to pretend the final state WAS the goal.
+            trainer.perform_her(episode_history, instance)
 
         # Step the gradients!
         res = trainer.train_step(batch_size=batch_size)
