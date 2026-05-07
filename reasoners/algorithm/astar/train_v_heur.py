@@ -464,6 +464,19 @@ class HeuristicTrainer:
             self.optimizer.zero_grad()
         else:
             self.optimizer.step()
+            
+        # NaN WEIGHT RECOVERY: After any optimizer step, scan LoRA weights for NaN/Inf
+        # and zero them out. In NF4 bitsandbytes training, occasionally a weight silently
+        # overflows to NaN. If not caught here, NaN * 0.0 (disabled adapter) still = NaN,
+        # which corrupts the generation probabilities and causes torch.multinomial to crash.
+        nan_params_reset = 0
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and param.data is not None:
+                if torch.isnan(param.data).any() or torch.isinf(param.data).any():
+                    param.data = torch.nan_to_num(param.data, nan=0.0, posinf=0.0, neginf=0.0)
+                    nan_params_reset += 1
+        if nan_params_reset > 0:
+            print(f"  [!] NaN RECOVERY: Reset {nan_params_reset} corrupted LoRA weight tensor(s) to 0.0")
         
         # MONITORING: Calculate Value Variance to see if the model is "dead"
         with torch.no_grad():
@@ -493,7 +506,8 @@ def main(
     use_cache: bool = True,                 
     max_steps: int = 10,
     temperature: float = 0.8,
-    save_model_every: int = None
+    save_model_every: int = None,
+    resume: str = None
 ):
     # ---------------------------------------------
     # SETUP LOGGING AND DIRS
@@ -623,6 +637,13 @@ def main(
     heur_model = ThoughtHeurModel(base_llm=peft_model, tokenizer=tokenizer, max_len=256)
     heur_model.to(peft_model.device)
     
+    # ---------------------------------------------
+    # RESUME FROM CHECKPOINT
+    # ---------------------------------------------
+    if resume:
+        print(f"Resuming training from checkpoint: {resume}")
+        heur_model.load_state_dict(torch.load(resume, map_location=peft_model.device), strict=False)
+    
     trainer = HeuristicTrainer(env, heur_model)
     trainer.base_llm = peft_model # Pass reference to trainer for mode switching
 
@@ -647,7 +668,8 @@ def main(
         state = env.reset(instance)
         episode_history = []
         
-        while True:
+        try:
+          while True:
             # Replay buffer observation happens BEFORE taking an action
             neighbors = trainer.add_to_buffer(state)
             episode_history.append((state, neighbors))
@@ -693,6 +715,14 @@ def main(
             
             # Formally take the step
             state, _ = env.world_model.step(state, action)
+
+        except Exception as e:
+            # CRASH RECOVERY: A NaN in the LoRA weights can cause torch.multinomial to crash.
+            # We catch it here, skip this episode, and let training continue.
+            # The NaN weight recovery in train_step() will sanitize the weights on the next step.
+            print(f"  [!] Episode {ep} skipped due to error: {type(e).__name__}: {e}")
+            ep += 1
+            continue
 
         # Track if this episode ended at the goal
         if env.is_goal(state):
