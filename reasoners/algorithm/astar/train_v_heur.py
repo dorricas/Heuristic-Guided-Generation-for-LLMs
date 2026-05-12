@@ -24,6 +24,21 @@ from reasoners.benchmark.blocksworld import BWEvaluator
 import reasoners.benchmark.bw_utils as bw_utils
 
 
+def save_replay_buffers(buffer_pos, buffer_neg, save_path):
+    """
+    Saves the current replay buffers to a file. 
+    Using .pth (torch.save) is more convenient than JSON because it preserves 
+    the complex BWState objects and instances without custom serialization.
+    """
+    data = {
+        'buffer_pos': list(buffer_pos),
+        'buffer_neg': list(buffer_neg),
+        'timestamp': datetime.datetime.now().isoformat()
+    }
+    torch.save(data, save_path)
+    print(f"Replay buffers saved to {save_path} (Pos: {len(buffer_pos)}, Neg: {len(buffer_neg)})")
+
+
 # ==========================================
 # 1. ENVIRONMENT WRAPPER
 # ==========================================
@@ -91,7 +106,8 @@ class BWThoughtEnv:
         for block in blocks:
             if f"the {block} block is on top of" in init_str:
                 m = re.search(rf"the {block} block is on top of the (\w+) block", init_str)
-                if m: world[block] = m.group(1)
+                if m:
+                    world[block] = m.group(1)
             else:
                 world[block] = "table"
 
@@ -323,7 +339,8 @@ class HeuristicTrainer:
         and re-evaluate the entire episode, flooding the replay buffer with perfect 
         0, 1, 2, 3.. distance labels for the Neural Network to learn from.
         """
-        if not episode_history: return
+        if not episode_history:
+            return
         
         # 1. Look at the final state of the failed episode
         final_state = episode_history[-1][0]
@@ -366,9 +383,9 @@ class HeuristicTrainer:
         if (len(self.buffer_pos) + len(self.buffer_neg)) < batch_size:
             return None
             
-        # PRIORITY SAMPLING: 50% from Positive Buffer, 50% from Negative
-        # We need to "scream" the goal signal (50% of batch) to drown out the garbage states.
-        n_pos = min(len(self.buffer_pos), batch_size // 2)
+        # PRIORITY SAMPLING: 20% from Positive Buffer, 80% from Negative
+        # We lower the goal signal to 20% of batch so we don't overfit to goals and can learn intermediate states.
+        n_pos = min(len(self.buffer_pos), max(1, int(batch_size * 0.2)))
         n_neg = batch_size - n_pos
         
         # Safely pull overflow from pos_buffer if neg_buffer hasn't populated entirely yet
@@ -420,7 +437,7 @@ class HeuristicTrainer:
                             break
                     
                     if n_count == 0:
-                        # True dead end (LLM proposed zero actions). Give a realistic max penalty instead of 50.
+                        # True dead end (LLM proposed zero valid actions)
                         targets.append(15.0)
                         continue
                         
@@ -501,13 +518,14 @@ def main(
     domain_file: str = 'examples/CoT/blocksworld/data/generated_domain.pddl',
     output_dir: str = 'logs/train_v_heur',
     batch_size: int = 16,
-    n_candidate: int = 4,                   
+    n_candidate: int = 8,                   
     max_episodes: int = 20,                
     use_cache: bool = True,                 
     max_steps: int = 10,
-    temperature: float = 0.8,
-    save_model_every: int = None,
-    resume: str = None
+    temperature: float = 1.2,
+    checkpoint_every: int = None,
+    resume: str = None,
+    save_trajectories: bool = False,
 ):
     # ---------------------------------------------
     # SETUP LOGGING AND DIRS
@@ -706,7 +724,8 @@ def main(
                     # Evaluate using the LoRA Network! (Enabled by default)
                     trainer.model.eval()
                     n_values = trainer.model(n_texts).squeeze(-1).tolist()
-                    if isinstance(n_values, float): n_values = [n_values]
+                    if isinstance(n_values, float):
+                        n_values = [n_values]
                 
                 # Pick thought with MINIMUM predicted cost
                 best_idx = n_values.index(min(n_values))
@@ -745,18 +764,27 @@ def main(
         if ep % 2 == 0:
             current_time = time.time()
             elapsed_since_log = current_time - last_log_time
-            total_elapsed = current_time - start_time
+            # total_elapsed = current_time - start_time
             
-            avg_time_per_ep = total_elapsed / max(1, ep)
-            est_remaining = avg_time_per_ep * (max_episodes - ep - 1)
-            est_rem_str = str(datetime.timedelta(seconds=int(est_remaining)))
+            # avg_time_per_ep = total_elapsed / max(1, ep)
+            # est_remaining = avg_time_per_ep * (max_episodes - ep - 1)
+            # est_rem_str = str(datetime.timedelta(seconds=int(est_remaining)))
             
-            print(f"Episode {ep:03d} | Loss: {loss:.3f} | Grad: {grad_norm:.2f} | Range: [{v_min:.1f}-{v_max:.1f}] | Std: {v_std:.2f} | Goals: {goals_reached}/2 | Time/2Ep: {elapsed_since_log:.1f}s | Est. Rem: {est_rem_str}")
+            print(f"Episode {ep:03d}"
+                  f" | Loss: {loss:.3f}"
+                  # f" | Grad: {grad_norm:.2f}"
+                  f" | Avg: {v_mean:.1f}"
+                  f" | Range: [{v_min:.1f}-{v_max:.1f}]"
+                  f" | Std: {v_std:.2f}"
+                  f" | Goals: {goals_reached}/2"
+                  f" | Time/2Ep: {elapsed_since_log:.1f}s"
+                  # f" | Est. Rem: {est_rem_str}"
+                  )
             
             goals_reached = 0  # Reset window counter
             last_log_time = current_time
 
-        if save_model_every is not None and ep > 0 and ep % save_model_every == 0:
+        if checkpoint_every is not None and ep > 0 and ep % checkpoint_every == 0:
             chkpt_dir = os.path.join(run_dir, "checkpoints")
             os.makedirs(chkpt_dir, exist_ok=True)
             chkpt_path = os.path.join(chkpt_dir, f"heur_model_ep{ep:05d}.pth")
@@ -764,10 +792,18 @@ def main(
             torch.save(trainable_state_dict, chkpt_path)
             print(f"  [>] Saved intermediate checkpoint to: {chkpt_path}")
 
+            if save_trajectories:
+                replay_buffers_path = os.path.join(chkpt_dir, f"replay_buffers_ep{ep:05d}.pkl")
+                save_replay_buffers(trainer.buffer_pos, trainer.buffer_neg, replay_buffers_path)
+
     print(f"\nTraining Complete! Saving final Model Weights to {run_dir}/heur_model.pth")
     # ONLY save the Trainable parameters (LoRA adapters + Value Head) to save 4.5GB of disk space!
     trainable_state_dict = {k: v for k, v in heur_model.state_dict().items() if "lora" in k or "value_head" in k}
     torch.save(trainable_state_dict, os.path.join(run_dir, "heur_model.pth"))
+
+    # Save replay buffers
+    if save_trajectories:
+        save_replay_buffers(trainer.buffer_pos, trainer.buffer_neg, os.path.join(run_dir, "replay_buffers.pkl"))
     
     # ---------------------------------------------
     # SAVE TRAINING GRAPHS
