@@ -79,24 +79,37 @@ class BWConfig(SearchConfig):
         self.n_candidate = n_candidate
         self.temperature = temperature
 
-    def get_actions(self, state: BWState) -> list[BWAction]:
-        prompts = self.prompt["icl"].replace("<action>", "\n".join(state.action_history + [""])) \
+    def get_prompt_by_state(self, state: BWState) -> str:
+        return self.prompt["icl"].replace("<action>", "\n".join(state.action_history + [""])) \
             .replace("<init_state>", utils.extract_init_state(self.example)) \
             .replace("<goals>", utils.extract_goals(self.example, return_raw=True))
-        ouputs = self.base_model.generate([prompts],
-                                          num_return_sequences=self.n_candidate,
-                                          #max_length=20,
-                                          eos_token_id=["\n", ],
-                                          temperature=self.temperature,
-                                          do_sample=True,
-                                          hide_input=True).text
-       
-        outputs = [output.split("\n")[0] for output in ouputs]
+
+
+    def get_actions(self, state: BWState) -> list[BWAction]:
+        return self.get_actions_generic(state)
+
+    def get_actions_generic(self, state, use_beam_search_outputs=False, do_sample=True):
+        """Generalization to get_actions method, allows to set various parameters to thought generation,
+        like beam search that create exactly top n thoughts deterministically, and maybe more options in the future."""
+        prompts = self.get_prompt_by_state(state)
+        num_beams = self.n_candidate if use_beam_search_outputs else None
+        outputs = self.base_model.generate([prompts],
+                                           num_return_sequences=self.n_candidate,
+                                           # max_length=20,
+                                           eos_token_id=["\n", ],
+                                           temperature=self.temperature,
+                                           do_sample=do_sample,
+                                           hide_input=True,
+                                           use_beam_search_outputs=use_beam_search_outputs,
+                                           num_beams=num_beams).text
+
+        outputs = [output.split("\n")[0] for output in outputs]
         # deduplicate
         outputs = list(dict.fromkeys(outputs))
         if '' in outputs:
             outputs.remove('')
         return outputs
+
 
     def get_pi(self, state:BWState, actions: list[BWAction], temperature=None):
         """

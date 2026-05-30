@@ -121,6 +121,8 @@ class HFModel(LanguageModel):
             eos_token_id: Union[None, str, int, list[str, int]] = None,
             hide_input: bool = True,
             output_log_probs: bool = False,
+            use_beam_search_outputs: bool=False,
+            num_beams: Optional[int]=None,
             **kwargs,
         ) -> GenerateOutput:
 
@@ -132,6 +134,13 @@ class HFModel(LanguageModel):
         max_new_tokens = 40 
         eos_token_id_input = copy.deepcopy(eos_token_id)
         eos_token_id = []
+
+        if use_beam_search_outputs:
+            assert len(inputs) == 1, (
+                "use_beam_search_outputs currently supports only a single prompt"
+            )
+            assert num_beams is not None
+            assert num_return_sequences <= num_beams
 
         if not do_sample or temperature == 0.0:
             warnings.warn('temperature=0.0 is equivalent to greedy search, ')
@@ -174,26 +183,43 @@ class HFModel(LanguageModel):
             top_k=top_k,
             top_p=top_p,
         )
-        
-        if num_return_sequences > 1:
-            assert len(inputs) == 1, 'num_return_sequences > 1 is not supported for multiple inputs'
-            inputs = inputs * num_return_sequences
+        if not use_beam_search_outputs:
+            if num_return_sequences > 1:
+                assert len(inputs) == 1, 'num_return_sequences > 1 is not supported for multiple inputs'
+                inputs = inputs * num_return_sequences
+
         decoded_list = []
         log_prob_list = []
         for start in range(0, len(inputs), self.max_batch_size):
             end = min(start + self.max_batch_size, len(inputs))
             encoded_inputs = self.tokenizer(inputs[start:end], return_tensors='pt', padding=True).to(self.device)
             with torch.inference_mode():
+                generate_kwargs = {
+                    "generation_config": generation_config,
+                    "output_scores": output_log_probs,
+                    "return_dict_in_generate": True,
+                }
+
+                if use_beam_search_outputs:
+                    generate_kwargs["num_return_sequences"] = num_return_sequences
+                    if num_beams is not None:
+                        generate_kwargs["num_beams"] = num_beams
+
                 generation_output = self.model.generate(
                     **encoded_inputs,
-                    generation_config=generation_config,
-                    output_scores=output_log_probs,
-                    return_dict_in_generate=True,
+                    **generate_kwargs,
                 )
             decoded = self.tokenizer.batch_decode(generation_output.sequences, skip_special_tokens=True)
             if hide_input:
-                for i in range(end-start):
-                    decoded[i] = decoded[i][len(inputs[start+i]):]
+                if use_beam_search_outputs:
+                    prompt_len = len(inputs[start])
+
+                    for i in range(len(decoded)):
+                        decoded[i] = decoded[i][prompt_len:]
+                else:
+                    for i in range(end - start):
+                        decoded[i] = decoded[i][len(inputs[start + i]):]
+
             log_prob = None
             if output_log_probs:
                 log_prob = generation_output.scores
