@@ -79,20 +79,32 @@ class BWConfig(SearchConfig):
         self.n_candidate = n_candidate
         self.temperature = temperature
 
-    def get_prompt_by_state(self, state: BWState) -> str:
+    def get_prompt_by_state(self, state: BWState, instance=None) -> str:
+        target_instance = instance if instance is not None else self.example
+        init_state = utils.extract_init_state(target_instance)
+        goals = utils.extract_goals(target_instance, return_raw=True)
+
         return self.prompt["icl"].replace("<action>", "\n".join(state.action_history + [""])) \
-            .replace("<init_state>", utils.extract_init_state(self.example)) \
-            .replace("<goals>", utils.extract_goals(self.example, return_raw=True))
+            .replace("<init_state>", init_state) \
+            .replace("<goals>", goals)
 
 
     def get_actions(self, state: BWState) -> list[BWAction]:
         return self.get_actions_generic(state)
 
-    def get_actions_generic(self, state, use_beam_search_outputs=False, do_sample=True):
+    def get_actions_generic(self, state, instance=None, deterministic=False):
         """Generalization to get_actions method, allows to set various parameters to thought generation,
         like beam search that create exactly top n thoughts deterministically, and maybe more options in the future."""
-        prompts = self.get_prompt_by_state(state)
-        num_beams = self.n_candidate if use_beam_search_outputs else None
+        num_beams = None
+        do_sample = True
+        use_beam_search_outputs = False
+
+        if deterministic:
+            num_beams = self.n_candidate
+            do_sample = False
+            use_beam_search_outputs = True
+
+        prompts = self.get_prompt_by_state(state, instance)
         outputs = self.base_model.generate([prompts],
                                            num_return_sequences=self.n_candidate,
                                            # max_length=20,
